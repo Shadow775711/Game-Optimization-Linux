@@ -519,6 +519,84 @@ class TesseractOcrProvider:
             return "Install the verified English OCR model"
         return "Tesseract subtitle OCR is ready"
 
+
+    def _rapid_tsv(self, image: QImage):
+        """Use local RapidOCR; return Tesseract-compatible TSV."""
+        self._rapid_last_ok = False
+        import urllib.request
+
+        data = QByteArray()
+        buffer = QBuffer(data)
+        if not buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+            return None
+        if not image.save(buffer, "PNG"):
+            buffer.close()
+            return None
+        buffer.close()
+
+        try:
+            request = urllib.request.Request(
+                "http://127.0.0.1:8765/ocr",
+                data=bytes(data),
+                headers={"Content-Type": "image/png"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=6) as response:
+                result = json.load(response)
+        except Exception as error:
+            logger.warning("RapidOCR unavailable: %s", error)
+            return None
+
+        header = chr(9).join(_TESSERACT_TSV_COLUMNS)
+        rows = [header]
+        candidates = []
+
+        for item in result.get("results", []):
+            phrase = str(item.get("text", "")).strip()
+            score = float(item.get("confidence", 0))
+            points = item.get("box", [])
+            if len(points) != 4:
+                continue
+
+            xs = [float(point[0]) for point in points]
+            ys = [float(point[1]) for point in points]
+            left, top = int(min(xs)), int(min(ys))
+            width = max(1, int(max(xs) - min(xs)))
+            height = max(1, int(max(ys) - min(ys)))
+            center_x = left + width / 2
+
+            # Reject HUD digits, weak OCR and text at region edges.
+            if score < 0.75 or len(phrase.split()) < 3:
+                continue
+            if sum(c.isalpha() for c in phrase) < 8:
+                continue
+            if not (image.width() * 0.20 < center_x < image.width() * 0.80):
+                continue
+
+            candidates.append((score, phrase, left, top, width, height))
+
+        # First test: one strongest dialogue line per frame.
+        if candidates:
+            score, phrase, left, top, width, height = max(candidates)
+            words = phrase.split()
+            offset = left
+            for index, word in enumerate(words, 1):
+                w = max(1, round(width * len(word) / max(1, len(phrase))))
+                rows.append(chr(9).join(map(str, [
+                    5, 1, 1, 1, 1, index,
+                    offset, top, w, height,
+                    round(score * 100, 2), word
+                ])))
+                offset += w + 2
+
+        logger.info(
+            "RapidOCR adapter: candidates=%d selected=%s",
+            len(candidates), candidates[0][1] if candidates else ""
+        )
+
+        self._rapid_last_ok = True
+        return chr(10).join(rows) + chr(10), False
+
     def recognize(self, frame: CaptureFrame, *, language: str) -> OcrResult:
         normalized_language = self._normalized_language(language)
         executable = self.executable
@@ -555,7 +633,12 @@ class TesseractOcrProvider:
         encoded_png = bytes(encoded)
         tesseract_language = "pol" if normalized_language == "pl" else "eng"
         source_resolution = self._source_resolution(image)
-        persistent = self._persistent_tsv(
+        persistent = None
+        if os.environ.get("GAMEOPTI_RAPIDOCR", "0") == "1":
+            persistent = self._rapid_tsv(roi_image)
+        if persistent is None:
+            self._rapid_last_ok = False
+            persistent = self._persistent_tsv(
             encoded_png,
             model=model,
             language=tesseract_language,
@@ -580,7 +663,7 @@ class TesseractOcrProvider:
         else:
             tsv, worker_restarted = persistent
             worker = self._worker
-            backend = "persistent"
+            backend = "rapidocr" if getattr(self, "_rapid_last_ok", False) else "persistent"
             recognition_ms = self._worker_metric(worker, "last_recognition_ms")
             worker_execution_ms = self._worker_metric(
                 worker, "last_worker_execution_ms"
@@ -2046,10 +2129,7 @@ class TesseractOcrProvider:
         if (
             not self._debug_capture_enabled
             or self._debug_capture_count >= self._debug_capture_limit
-            or (
-                not text.strip()
-                and not any(str(token.get("text", "")).strip() for token in tokens)
-            )
+
         ):
             return ""
         try:

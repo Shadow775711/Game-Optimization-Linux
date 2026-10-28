@@ -1520,6 +1520,10 @@ class SubtitleTextGate:
             self.last_line_similarity = accepted_metrics.char_similarity
         if self._accepted_identity and (
             _same_episode_variant(filtered, self._accepted_text)
+            or (
+                accepted_metrics.char_similarity >= 0.82
+                and accepted_metrics.token_similarity >= 0.45
+            )
             or _line_extension_variant(observed_lines, self._accepted_lines)
             or _long_episode_variant(
                 filtered, observed_lines, self._accepted_text, self._accepted_lines
@@ -3861,8 +3865,21 @@ class NarratorPipeline:
                 now=now,
                 raw_text=result.raw_text or result.text,
                 strong_short_phrase_evidence=(
-                    result.clean_short_phrase_evidence
-                    and visual_decision in {"initial_probe", "localized_change"}
+                    (
+                        result.clean_short_phrase_evidence
+                        and visual_decision in {"initial_probe", "localized_change"}
+                    )
+                    or (
+                        result.backend == "rapidocr"
+                        and result.confidence is not None
+                        and result.confidence >= 0.88
+                        and result.quality_score is not None
+                        and result.quality_score >= 0.85
+                        and len(result.filtered_text.split()) >= 3
+                        and sum(c.isalpha() for c in result.filtered_text) >= 12
+                        and not any(c.isdigit() for c in result.filtered_text)
+                        and visual_decision in {"initial_probe", "localized_change"}
+                    )
                 ),
                 quality_score=result.quality_score,
                 selected_line_confidence=result.selected_line_confidence,
